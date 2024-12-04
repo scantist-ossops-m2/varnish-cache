@@ -111,6 +111,7 @@ http1_dissect_hdrs(struct http *hp, char *p, struct http_conn *htc,
     unsigned maxhdr)
 {
 	char *q, *r, *s;
+	int i;
 
 	assert(p > htc->rxbuf_b);
 	assert(p <= htc->rxbuf_e);
@@ -120,31 +121,34 @@ http1_dissect_hdrs(struct http *hp, char *p, struct http_conn *htc,
 
 		/* Find end of next header */
 		q = r = p;
-		if (vct_iscrlf(p))
+		if (vct_iscrlf(p, htc->rxbuf_e))
 			break;
 		while (r < htc->rxbuf_e) {
 			if (!vct_isctl(*r) || vct_issp(*r)) {
 				r++;
 				continue;
 			}
-			if (!vct_iscrlf(r)) {
+			i = vct_iscrlf(r, htc->rxbuf_e);
+			if (i == 0) {
 				VSLb(hp->vsl, SLT_BogoHeader,
 				    "Header has ctrl char 0x%02x", *r);
 				return (400);
 			}
 			q = r;
-			assert(r < htc->rxbuf_e);
-			r += vct_skipcrlf(r);
-			if (r >= htc->rxbuf_e)
+			r += i;
+			assert(r <= htc->rxbuf_e);
+			if (r == htc->rxbuf_e)
 				break;
-			if (vct_iscrlf(r))
+			if (vct_iscrlf(r, htc->rxbuf_e))
 				break;
 			/* If line does not continue: got it. */
 			if (!vct_issp(*r))
 				break;
 
 			/* Clear line continuation LWS to spaces */
-			while (vct_islws(*q))
+			while (q < r)
+				*q++ = ' ';
+			while (q < htc->rxbuf_e && vct_issp(*q))
 				*q++ = ' ';
 		}
 
@@ -200,11 +204,9 @@ http1_dissect_hdrs(struct http *hp, char *p, struct http_conn *htc,
 			return (400);
 		}
 	}
-	/* We cannot use vct_skipcrlf() we have to respect rxbuf_e */
-	if (p+2 <= htc->rxbuf_e && p[0] == '\r' && p[1] == '\n')
-		p += 2;
-	else if (p+1 <= htc->rxbuf_e && p[0] == '\n')
-		p += 1;
+	i = vct_iscrlf(p, htc->rxbuf_e);
+	assert(i > 0);		/* HTTP1_Complete guarantees this */
+	p += i;
 	HTC_RxPipeline(htc, p);
 	htc->rxbuf_e = p;
 	return (0);
@@ -218,7 +220,7 @@ static uint16_t
 http1_splitline(struct http *hp, struct http_conn *htc, const int *hf,
     unsigned maxhdr)
 {
-	char *p;
+	char *p, *q;
 	int i;
 
 	assert(hf == HTTP1_Req || hf == HTTP1_Resp);
@@ -259,26 +261,34 @@ http1_splitline(struct http *hp, struct http_conn *htc, const int *hf,
 	hp->hd[hf[1]].e = p;
 	if (!Tlen(hp->hd[hf[1]]))
 		return (400);
-	*p++ = '\0';
 
 	/* Skip SP */
+	q = p;
 	for (; vct_issp(*p); p++) {
 		if (vct_isctl(*p))
 			return (400);
 	}
-	hp->hd[hf[2]].b = p;
+	if (q < p)
+		*q = '\0';	/* Nul guard for the 2nd field. If q == p
+				 * (the third optional field is not
+				 * present), the last nul guard will
+				 * cover this field. */
 
 	/* Third field is optional and cannot contain CTL except TAB */
-	for (; !vct_iscrlf(p); p++) {
-		if (vct_isctl(*p) && !vct_issp(*p)) {
-			hp->hd[hf[2]].b = NULL;
+	q = p;
+	for (; p < htc->rxbuf_e && !vct_iscrlf(p, htc->rxbuf_e); p++) {
+		if (vct_isctl(*p) && !vct_issp(*p))
 			return (400);
-		}
 	}
-	hp->hd[hf[2]].e = p;
+	if (p > q) {
+		hp->hd[hf[2]].b = q;
+		hp->hd[hf[2]].e = p;
+	}
 
 	/* Skip CRLF */
-	i = vct_skipcrlf(p);
+	i = vct_iscrlf(p, htc->rxbuf_e);
+	if (!i)
+		return (400);
 	*p = '\0';
 	p += i;
 
